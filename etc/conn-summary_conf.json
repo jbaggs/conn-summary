@@ -1,0 +1,37 @@
+{
+    "elasticsearch": {
+        "host": "127.0.0.1",
+        "port": 9200,
+        "timeout": 50,
+        "use_ssl": false,
+        "verify_certs": false,
+        "ca_certs": "/usr/local/etc/ssl/local/ca/ca.crt",
+        "client_cert": "/usr/local/etc/ssl/client/client_cert.pem",
+        "client_key": "/usr/local/etc/ssl/client/private/client_key.pem"
+    },
+    "zeek": {
+        "index_pattern": "zeek_*",
+        "log_stream": {
+            "key": "stream",
+            "name": "conn"
+        },
+        "remap": {
+            "conn_state": "conn_state",
+            "duration": "duration",
+            "id.orig_h": "id.orig_h",
+            "id.orig_p": "id.orig_p",
+            "id.resp_h": "id.resp_h",
+            "id.resp_p": "id.resp_p",
+            "orig_bytes": "orig_bytes",
+            "proto": "proto",
+            "resp_bytes": "resp_bytes",
+            "service": "service",
+            "ts": "ts",
+            "uid": "uid"
+        }
+    },
+    "zeekctl": {
+        "networks": "/usr/local/etc/networks.cfg",
+        "lib_path": "/usr/local/lib/zeekctl"
+    }
+}

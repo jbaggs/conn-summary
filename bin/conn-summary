@@ -1,0 +1,659 @@
+#! /usr/bin/env python
+from __future__ import print_function
+from elasticsearch import Elasticsearch
+from json import load
+import datetime as dt
+import re
+import os
+import sys
+import socket
+import signal
+import posix
+import errno
+import optparse
+import subprocess
+
+VERSION = "0.06"
+
+# Path to configuration. (Change as appropriate.)
+with open('/usr/local/etc/conn-summary_conf.json') as fh:
+    conf = load(fh)
+
+# Path to locate SubnetTree module bundled with zeekctl.
+if 'lib_path' in conf['zeekctl'] and len (conf['zeekctl']['lib_path']) > 0:
+    sys.path.insert(0, conf['zeekctl']['lib_path'])
+
+import SubnetTree
+
+Protocols = { "T": 6, "tcp": 6, "U": 17, "udp": 17, "I": 1, "icmp": 1 }
+
+class IntervalUpdate:
+    pass
+
+class IntervalList:
+    def __init__(self):
+        self.ints = []
+        self.start = -1
+
+    def finish(self):
+        for i in self.ints:
+            if i:
+                i.start += self.start
+                i.end += self.start
+
+class Interval:
+    def __init__(self):
+        self.start = 1e20
+        self.end = 0
+        self.bytes = 0
+        self.payload = 0
+        self.pkts = 0
+        self.frags = 0
+        self.updates = 0
+        self.ports = {}
+        self.prots = {}
+        self.servs = {}
+        self.srcs = {}
+        self.dsts = {}
+        self.states = {}
+
+    def update(self, iupdate, adjusttime=True):
+
+        self.updates += 1
+        self.pkts += iupdate.pkts
+        self.bytes += iupdate.bytes
+        self.payload += iupdate.payload
+        self.frags += iupdate.frags
+
+        if Options.bytes:
+            incr = iupdate.bytes
+        else:
+            incr = 1
+
+        if ( iupdate.dst_port < 1024 ) or \
+            (not Ports) or \
+            ( Ports and iupdate.dst_port in Ports ):
+            try:
+                self.ports[iupdate.dst_port] += incr
+            except KeyError:
+                self.ports[iupdate.dst_port] = incr
+
+        try:
+            self.prots[iupdate.prot] += incr
+        except KeyError:
+            self.prots[iupdate.prot] = incr
+
+        try:
+            self.servs[iupdate.service] += incr
+        except KeyError:
+            self.servs[iupdate.service] = incr
+
+        try:
+            self.states[iupdate.state] += incr
+        except KeyError:
+            self.states[iupdate.state] = incr
+
+        if adjusttime:
+            if iupdate.start < self.start:
+                self.start = iupdate.start
+
+            if iupdate.end > self.end:
+                self.end = iupdate.end
+
+        try:
+            self.srcs[iupdate.src_ip] += incr
+        except KeyError:
+            self.srcs[iupdate.src_ip] = incr
+
+        try:
+            self.dsts[iupdate.dst_ip] += incr
+        except KeyError:
+            self.dsts[iupdate.dst_ip] = incr
+
+    def format(self, title=""):
+        def fmt(tag, count, total=-1, sep=" - "):
+            if total >= 0:
+                try:
+                    return "%s %5.1f%%%s" % (tag, (float(count) / total) * 100, sep)
+                except ZeroDivisionError:
+                    return "%s (??%%)%s" % (tag, sep)
+
+            return "%s %s%s" % (tag, formatVal(count), sep)
+
+        s = "\n>== %s === %s - %s\n   - " % (title, isoTime(self.start), isoTime(self.end))
+
+            # Information for connection summaries.
+        s += fmt("Connections", self.pkts) + \
+             fmt("Payload", self.payload)
+
+        ports = topx(self.ports)
+        srcs = topx(self.srcs)
+        dsts = topx(self.dsts)
+        prots = topx(self.prots)
+        servs = topx(self.servs)
+
+        servs = [ (count, svc.replace("icmp-", "i-").replace("netbios", "nb")) for count, svc in servs ]
+
+        # Default column widths for IP addresses.
+        srcwidth = 18
+        dstwidth = 18
+
+        # Check all IP addrs to see if column widths need to be increased
+        # (due to the presence of long IPv6 addresses).
+        src_over = 0
+        dst_over = 0
+        for i in range(Options.topx):
+            for dict in (srcs, dsts):
+                try:
+                    item = inet_ntox(dict[i][1])
+                except IndexError:
+                    continue
+
+                # Note: 15 is longest possible IPv4 address.
+                oversize = len(item) - 15
+                if oversize > 0:
+                    if dict is srcs:
+                        src_over = max(src_over, oversize)
+                    elif dict is dsts:
+                        dst_over = max(dst_over, oversize)
+
+        # Increase column widths, if necessary.
+        srcwidth += src_over
+        dstwidth += dst_over
+
+        s += "\n     %-5s        | %-*s        | %-*s        | %-18s | %1s |" \
+            % ("Ports", srcwidth, "Sources", dstwidth, "Destinations", "Services", "Protocols")
+
+        s += " States        |"
+        states = (topx(self.states), 6)
+
+        s += "\n"
+
+        addrs = []
+
+        for i in range(Options.topx):
+
+            s += "     "
+
+            for (dict, length) in ((ports, 5), (srcs, srcwidth), (dsts, dstwidth), (servs, 11), (prots, 2), states):
+                try:
+                    item = None
+                    if dict is srcs or dict is dsts:
+                        item = inet_ntox(dict[i][1])
+                        addrs += [dict[i][1]]
+                        item += "#%d" % len(addrs)
+                    else:
+                        item = str(dict[i][1])
+
+                    s += fmt("%-*s" % (length, item), dict[i][0], (Options.bytes and self.bytes or self.pkts), sep=" | ")
+                except:
+                    s += " " * length + "        | "
+
+            s += "\n"
+
+        s += "\n        "
+        for i in range(1, len(addrs)+1):
+            s +=  "#%d=%s  " % (i, gethostbyaddr(inet_ntox(addrs[i-1])))
+            if i % 3 == 0:
+                s += "\n        "
+
+        s += "\n"
+
+        return s
+
+    def __str__(self):
+        return self.format(True)
+
+def topx(dict, fill_if_empty=False):
+    top = sorted([ (count, val) for val, count in dict.items() ], reverse=True)
+
+    # Filter out zero vals.
+    top = [(val, count) for (val, count) in top if count != 0]
+
+    if fill_if_empty and len(top) < Options.topx:
+        top += [(0,0)] * Options.topx
+
+    return top[:Options.topx]
+
+def findInterval(time, intervals):
+
+    if intervals.start < 0:
+        intervals.start = int(time / Options.ilen) * Options.ilen
+
+    i = (time - intervals.start) / Options.ilen
+    idx = int(i)
+
+    # Interval may be earlier than current start
+    if i < 0:
+
+        if float(idx) != i:
+            # minus 1 since we will multiply by -1
+            idx -= 1
+
+        idx *= -1
+
+        for j in intervals.ints:
+            if j:
+                j.start += Options.ilen * idx
+                j.end += Options.ilen * idx
+
+        intervals.ints = ([None] * idx) + intervals.ints
+        intervals.start = int(time / Options.ilen) * Options.ilen
+        first = time
+        idx = 0
+
+    # Interval may be later than current end
+    while idx >= len(intervals.ints):
+        intervals.ints += [None]
+
+    if not intervals.ints[idx]:
+        interv = Interval()
+        interv.start = float(idx * Options.ilen)
+        interv.end =  float((idx+1) * Options.ilen)
+        intervals.ints[idx] = interv
+        return interv
+
+    return intervals.ints[idx]
+
+def isoTime(t):
+    if t == 1e20 or t == 0:
+        return "N/A"
+    else:
+        return iso8601(t)
+
+def iso2Epoch(ts):
+    p = '%Y-%m-%dT%H:%M:%S.%fZ'
+    epoch = dt.datetime(1970, 1, 1)
+    t = (dt.datetime.strptime(ts, p) - epoch).total_seconds()
+    return t
+
+def iso8601(t):
+    ts = dt.datetime.fromtimestamp(t, dt.timezone.utc)
+    return dt.datetime.strftime(ts, '%Y-%m-%dT%H:%M:%S.%fZ')
+
+def calcScrollVal(t1, t2):
+    # 5 seconds per hour of data; 5 minute max
+    return "%ds" % min((-((t1 - t2) // 3600) * 5), 300)
+
+def getConnSummaries(t1 ,t2):
+    client = Elasticsearch([conf['elasticsearch']['host']], port=conf['elasticsearch']['port'],
+        timeout=conf['elasticsearch']['timeout'], use_ssl=conf['elasticsearch']['use_ssl'],
+        verify_certs=conf['elasticsearch']['verify_certs'], ca_certs=conf['elasticsearch']['ca_certs'],
+        client_cert=conf['elasticsearch']['client_cert'], client_key=conf['elasticsearch']['client_key'])
+
+    d = client.search(index=conf['zeek']['index_pattern'], scroll=calcScrollVal(t1, t2),
+    body={"query": {"bool": {"must": {"range": {conf['zeek']['remap']['ts']: 
+        {"gte": iso8601(t1), "lte": iso8601(t2)}}},  "filter":{"term":{conf['zeek']['log_stream']['key']: 
+        conf['zeek']['log_stream']['name']}}}}})
+
+    sid = d['_scroll_id']
+    s_size = len(d['hits']['hits'])
+
+    #scrolling...
+    while s_size > 0:
+        for hit in d['hits']['hits']:
+            parseConnEvent(hit['_source'])
+
+        d = client.scroll(scroll_id=sid, scroll='5s')
+        sid = d['_scroll_id']
+        s_size = len(d['hits']['hits'])
+
+    return
+        
+def parseConnEvent(f):
+    global Total, Incoming, Outgoing, LastOutputTime, BaseTime
+
+    proto_val = f[conf['zeek']['remap']['proto']]
+    time = iso2Epoch(f[conf['zeek']['remap']['ts']])
+    unset_field = "-"
+    try:
+        duration_str = f[conf['zeek']['remap']['duration']]
+        duration = float(duration_str)
+
+    except (KeyError, ValueError):
+        duration = 0
+
+    if not BaseTime:
+        BaseTime = time
+        LastOutputTime = time
+
+    if time - LastOutputTime > 3600:
+        LastOutputTime = time
+
+    try:
+        orig_bytes_str = f[conf['zeek']['remap']['orig_bytes']]
+    except KeyError:
+        orig_bytes_str = unset_field
+
+    try:
+        resp_bytes_str = f[conf['zeek']['remap']['resp_bytes']]
+    except KeyError:
+        resp_bytes_str = unset_field
+
+    try:
+        bytes_orig = int(orig_bytes_str)
+    except ValueError:
+        bytes_orig = 0
+
+    try:
+        bytes_resp = int(resp_bytes_str)
+    except ValueError:
+        bytes_resp = 0
+
+    iupdate = IntervalUpdate()
+    iupdate.pkts = 1 # no. connections
+    iupdate.bytes = bytes_orig + bytes_resp
+    iupdate.src_ip = inet_xton(f[conf['zeek']['remap']['id.orig_h']])
+    iupdate.src_port = int(f[conf['zeek']['remap']['id.orig_p']])
+    iupdate.dst_ip = inet_xton(f[conf['zeek']['remap']['id.resp_h']])
+    iupdate.dst_port = int(f[conf['zeek']['remap']['id.resp_p']])
+    iupdate.prot = Protocols[proto_val]
+
+    try:
+        iupdate.service = f[conf['zeek']['remap']['service']]
+        if iupdate.service[-1] == "?":
+            iupdate.service = iupdate.service[:-1]
+
+    except (KeyError, IndexError):
+        iupdate.service = unset_field
+
+    iupdate.frags = 0
+    iupdate.state = f[conf['zeek']['remap']['conn_state']]
+    iupdate.start = time
+    iupdate.end = time + duration
+
+    payload_orig = bytes_orig
+    payload_resp = bytes_resp
+
+    if duration:
+        bytes_to_mbps = 8 / (1024 * 1024 * duration)
+
+        if payload_orig * bytes_to_mbps > 700:
+            # Bandwidth exceed due to Bro bug.
+            uid = f[conf['zeek']['remap']['uid']]
+            print("UID %s originator exceeds bandwidth" % uid, file=sys.stderr)
+            payload_orig = 0
+
+        if payload_resp * bytes_to_mbps > 700:
+            # Bandwidth exceed due to Bro bug.
+            uid = f[conf['zeek']['remap']['uid']]
+            print("UID %s originator exceeds bandwidth" % uid, file=sys.stderr)
+            payload_resp = 0
+
+    iupdate.payload = payload_orig + payload_resp
+    Total.update(iupdate)
+
+    if Options.ilen > 0:
+        interval = findInterval(time, TotalIntervals)
+        interval.update(iupdate, adjusttime=False)
+
+    try:
+        LocalNetsIntervals[iupdate.src_ip].update(iupdate)
+        Outgoing.update(iupdate)
+        if Options.ilen > 0:
+            interval = findInterval(time, OutgoingIntervals)
+            interval.update(iupdate, adjusttime=False)
+    except KeyError:
+        try:
+            LocalNetsIntervals[iupdate.dst_ip].update(iupdate)
+            Incoming.update(iupdate)
+            if Options.ilen > 0:
+                interval = findInterval(time, IncomingIntervals)
+                interval.update(iupdate, adjusttime=False)
+        except KeyError:
+            global NonLocalCount
+            NonLocalCount += 1
+            if NonLocalCount < Options.topx:
+                NonLocalConns[(iupdate.src_ip, iupdate.dst_ip)] = 1
+
+Cache = {}
+
+def gethostbyaddr( ip, timeout = 5, default = "<???>" ):
+
+    try:
+        return Cache[ip]
+    except LookupError:
+        pass
+
+    host = default
+    ( pin, pout ) = os.pipe()
+
+    pid = os.fork()
+
+    if not pid:
+        # Child
+        os.close( pin )
+        try:
+            host = socket.gethostbyaddr( ip )[0]
+        except socket.herror:
+            pass
+
+        host = host.encode()
+        os.write( pout, host )
+        posix._exit(127)
+
+    #Parent
+    os.close( pout )
+
+    signal.signal( signal.SIGALRM, lambda sig, frame: os.kill( pid, signal.SIGKILL ) )
+    signal.alarm( timeout )
+
+    try:
+        childpid, status = os.waitpid(pid, 0)
+
+        if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 127:
+            host = os.read(pin, 8192).decode()
+
+    except OSError:
+        # If the child process is killed while waitpid() is waiting, then
+        # only Python 2 (not Python 3) raises OSError.
+        pass
+
+    signal.alarm( 0 )
+    os.close( pin )
+    Cache[ip] = host
+
+    return host
+
+def formatVal(val):
+    for (prefix, unit, factor) in (("", "g", 1e9), ("", "m", 1e6), ("", "k", 1e3), (" ", "", 1e0)):
+        if val >= factor:
+            return "%s%3.1f%s" % (prefix, val / factor, unit)
+    return val # Should not happen
+
+def readNetworks(file):
+
+    nets = []
+
+    for line in open(file):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        fields = line.split()
+        nets += [(fields[0], " ".join(fields[1:]))]
+
+    return nets
+
+def inet_xton(ipstr):
+    family = socket.AF_INET
+
+    if ':' in ipstr:
+        family = socket.AF_INET6
+
+    return socket.inet_pton(family, ipstr)
+
+def inet_ntox(ipaddr):
+    family = socket.AF_INET
+
+    if len(ipaddr) != 4:
+        family = socket.AF_INET6
+
+    return socket.inet_ntop(family, ipaddr)
+
+def unspecified_addr(ipstr):
+    if ':' in ipstr:
+        ipaddr = inet_xton("::")
+    else:
+        ipaddr = inet_xton("0.0.0.0")
+
+    return ipaddr
+
+####### Main
+
+Total = Interval()
+Incoming = Interval()
+Outgoing = Interval()
+
+TotalIntervals = IntervalList()
+IncomingIntervals = IntervalList()
+OutgoingIntervals = IntervalList()
+
+BaseTime = None
+LastOutputTime = None
+
+LocalNets = {}
+LocalNetsIntervals = SubnetTree.SubnetTree(True)
+NonLocalConns = {}
+NonLocalCount = 0
+
+Ports = None
+
+optparser = optparse.OptionParser(usage="%prog [options] | %prog [options] <time | interval> |  %prog [options] <time> <time> ", version=VERSION)
+optparser.add_option("-b", "--bytes", action="store_true", dest="bytes", default=False,
+                     help="count fractions in terms of bytes rather than packets/connections")
+optparser.add_option("-i", "--intervals", action="store", type="string", dest="ilen", default="0",
+                     help="create summaries for time intervals of given length (seconds, or use suffix of 'h' for hours, or 'm' for minutes)")
+optparser.add_option("-n", "--topn", action="store", type="int", dest="topx", default=10,
+                     help="show top <n>")
+
+(Options, args) = optparser.parse_args()
+if len(args) > 2:
+    optparser.error("Too many arguments")
+
+elif len(args) == 0:
+    t_end = dt.datetime.now(tz=dt.timezone.utc).timestamp()
+    t_start = t_end - (60 * 60)
+
+# Validate input and determine time values.
+else:
+    valid = re.compile('(^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{1,6}Z$)|(^\d{1,4}m$)|(^\d{1,2}h$)')
+    if len(args) == 2:
+        match = valid.match(args[0])
+        if match and match[1]:
+            t_start = iso2Epoch(match[1])
+        else:
+            print("Invalid start time. Times must be in the format: %Y-%m-%dT%H:%M:%S.%fZ", file=sys.stderr)
+            sys.exit(1)
+
+        match = valid.match(args[1])
+        if match and match[1]:
+            t_end = iso2Epoch(match[1])
+        else:
+            print("Invalid end time. Times must be in the format: %Y-%m-%dT%H:%M:%S.%fZ", file=sys.stderr)
+            sys.exit(1)
+        
+        # Obey the laws of thermodynamics.
+        if t_start > t_end:
+            tmp = t_start
+            t_start = t_end
+            t_end = tmp
+
+    else:
+        t_end = dt.datetime.now(tz=dt.timezone.utc).timestamp()
+        match = valid.match(args[0])
+        t_int = 0
+        t_start = 0
+        if match:
+            if match[1]:
+                t_start = iso2Epoch(match[1])
+            elif match[2]:
+                t_int = int(match[2][:-1]) * 60
+            elif match[3]:
+                t_int = int(match[3][:-1]) * 60 * 60
+
+            if t_int:
+                if t_int <= 60 * 60 * 24:
+                    t_start = t_end - t_int
+                else:
+                    print("For intervals greater than 24h, specify a start time in the format: %Y-%m-%dT%H:%M:%S.%fZ", file=sys.stderr)
+                    sys.exit(1)
+
+            elif not t_start:
+                print("Invalid time interval", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print("Invalid argument", file=sys.stderr)
+            sys.exit(1)
+
+if Options.topx < 0:
+    print("Top-n value cannot be negative", file=sys.stderr)
+    sys.exit(1)
+
+# Make per-interval summaries.
+if Options.ilen:
+    if Options.ilen.endswith("m"):
+        Options.ilen = int(Options.ilen[:-1]) * 60
+    elif Options.ilen.endswith("h"):
+        Options.ilen = int(Options.ilen[:-1]) * 60 * 60
+    else:
+        Options.ilen = int(Options.ilen)
+
+    if Options.ilen < 0:
+        print("Interval length cannot be negative", file=sys.stderr)
+        sys.exit(1)
+
+# Read local networks.
+if 'networks' in conf['zeekctl'] and len(conf['zeekctl']['networks']) > 0:
+    for (net, txt) in readNetworks(conf['zeekctl']['networks']):
+        try:
+            i = Interval()
+            LocalNetsIntervals[net] = i
+            LocalNets[net] = (txt, i)
+        except KeyError:
+            print("Can't parse local network '%s'" % net, file=sys.stderr)
+
+# Do the business.
+getConnSummaries(t_start,t_end)
+
+TotalIntervals.finish()
+IncomingIntervals.finish()
+OutgoingIntervals.finish()
+
+for i in TotalIntervals.ints:
+    if i:
+        print(i.format())
+
+print(Total.format(title="Total"))
+
+locals = list(LocalNets.keys())
+
+for net in locals:
+    (txt, i) = LocalNets[net]
+
+if locals:
+    type = "connections"
+    locals.sort(key=lambda x: LocalNets[x][1].pkts, reverse=True)
+    print("\n>== Top %d local networks by number of %s\n" % (Options.topx, type))
+
+    for i in range(min(len(locals), Options.topx)):
+        print("    %2d %5s  %-16s %s " % (i+1, formatVal(LocalNets[locals[i]][1].pkts), locals[i], LocalNets[locals[i]][0]))
+
+    print()
+
+    if len(NonLocalConns):
+        print("\n>== %d %s did not have any local address. Here are the first %d:\n" % (NonLocalCount, type, Options.topx))
+
+        for (src,dst) in sorted(NonLocalConns.keys()):
+            print("    %s <-> %s" % (inet_ntox(src), inet_ntox(dst)))
+
+if 'networks' in conf['zeekctl'] and len(conf['zeekctl']['networks']) > 0:
+    print(Incoming.format(title="Incoming"))
+    print(Outgoing.format(title="Outgoing"))
+
+for net in locals:
+    (txt, i) = LocalNets[net]
+
+    if i.updates:
+        print(i.format(title=net + " " + txt))
+print("First: %16s (%.6f) Last: %s (%.6f)" % (iso8601(Total.start), Total.start, iso8601(Total.end), Total.end))
