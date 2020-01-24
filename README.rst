@@ -58,7 +58,7 @@ Fields in ``conn-summary_conf.json`` that will likely need editing:
 * ``"zeek": "index_pattern"`` The pattern to match indices containing Zeek data.
 * ``"zeek": "log_stream": "key"`` The key that identifies what Zeek log stream a record is from.
 * ``"zeek": "log_stream": "name"`` What the Zeek conn.log  stream is named in Elasticsearch. 
-* ``"zeek": "remap"`` Change any fields here that are remapped in your zeek -> Elasticsearch pipeline.
+* ``"zeek": "remap"`` Change any fields here that are remapped in your Zeek -> Elasticsearch pipeline.
 
 Options:
 
