@@ -656,4 +656,4 @@ for net in locals:
 
     if i.updates:
         print(i.format(title=net + " " + txt))
-print("First: %16s (%.6f) Last: %s (%.6f)" % (iso8601(Total.start), Total.start, iso8601(Total.end), Total.end))
+print("First: %16s (%.6f) Last: %s (%.6f)" % (isoTime(Total.start), Total.start, isoTime(Total.end), Total.end))
