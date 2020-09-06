@@ -272,8 +272,8 @@ def iso8601(t):
     return dt.datetime.strftime(ts, '%Y-%m-%dT%H:%M:%S.%fZ')
 
 def calcScrollVal(t1, t2):
-    # 5 seconds per hour of data; 5 minute max
-    return "%ds" % min((-((t1 - t2) // 3600) * 5), 300)
+    # 1 second per hour of data; 5 second min; 3 minute max
+    return "%ds" % max (5 ,min((-((t1 - t2) // 3600) * 5), 180))
 
 def getConnSummaries(t1 ,t2):
     client = Elasticsearch([conf['elasticsearch']['host']], port=conf['elasticsearch']['port'],
