@@ -39,7 +39,7 @@ Prerequisites
   `elasticsearch-py (pypi) <https://pypi.org/project/elasticsearch>`_
 
 * If installed on a system not running Zeek, the `pysubnettree
-  <https://github.com/zeek/pysubnettree>`_ module will need to be installed separately.
+  <https://github.com/zeek/pysubnettree>`_ package will need to be installed separately.
 
 Installation
 ------------
